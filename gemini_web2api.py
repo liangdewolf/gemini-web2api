@@ -484,7 +484,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             think_override = int(think_str)
         cfg = MODELS.get(model_name)
         if not cfg:
-            return None, None, None, f"Unknown model: {model_name}"
+            log(f"Unknown model '{model_name}', falling back to '{CONFIG['default_model']}'")
+            model_name = CONFIG["default_model"]
+            cfg = MODELS[model_name]
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools):
@@ -652,14 +654,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.end_headers()
             ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
             self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
+            for oi, item in enumerate(output):
+                added = {"type": "response.output_item.added", "output_index": oi, "item": item}
+                self.wfile.write(f"event: response.output_item.added\ndata: {json.dumps(added)}\n\n".encode())
                 if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
+                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": oi, "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
                     self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
                 elif item["type"] == "message":
                     for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
+                        delta = {"type": "response.output_text.delta", "item_id": item["id"], "output_index": oi, "content_index": ci, "delta": cp["text"]}
+                        self.wfile.write(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n".encode())
+                        ev = {"type": "response.output_text.done", "item_id": item["id"], "output_index": oi, "content_index": ci, "text": cp["text"]}
                         self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
+                done = {"type": "response.output_item.done", "output_index": oi, "item": item}
+                self.wfile.write(f"event: response.output_item.done\ndata: {json.dumps(done)}\n\n".encode())
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
                         "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
             self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
