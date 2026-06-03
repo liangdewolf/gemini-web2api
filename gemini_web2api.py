@@ -32,6 +32,7 @@ import os
 import hashlib
 import argparse
 import base64
+import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -205,7 +206,24 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             return resp.read().decode("utf-8", errors="replace")
+        except http.client.IncompleteRead as e:
+            # Salvage the bytes already received instead of discarding them.
+            # Truncated long responses (e.g. large tool_call arguments) are
+            # usable; a full restart would re-roll the non-deterministic model.
+            partial = getattr(e, "partial", b"")
+            log(f"IncompleteRead: recovered {len(partial)} partial bytes (attempt {attempt+1})")
+            if partial and len(partial) > 200:
+                return partial.decode("utf-8", errors="replace")
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
+            # urllib may wrap IncompleteRead inside URLError(reason=...)
+            reason = getattr(e, "reason", None)
+            partial = getattr(reason, "partial", None) or getattr(e, "partial", None)
+            if partial and len(partial) > 200:
+                log(f"IncompleteRead (wrapped): recovered {len(partial)} partial bytes (attempt {attempt+1})")
+                return partial.decode("utf-8", errors="replace")
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -356,11 +374,31 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
             })
         if tool_defs:
             parts.append(
-                "[System instruction]: You have access to tools. "
-                "To call a tool, respond with:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "Only use tool_call blocks when needed.\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                "[System instruction]: You are an autonomous agent connected to a REAL execution "
+                "environment. The tools listed below are REAL and actually run on the user's machine "
+                "(e.g. they create files, run shell commands). They are NOT hypothetical.\n\n"
+                "CRITICAL RULES — you MUST obey:\n"
+                "1. To perform ANY action (write a file, run a command, read a directory, etc.) you MUST "
+                "emit a tool call. You CANNOT perform actions by describing them in prose.\n"
+                "2. A tool call MUST be a fenced code block tagged `tool_call` containing a SINGLE JSON "
+                "object with exactly two keys: \"name\" (string) and \"arguments\" (object). Example:\n"
+                "```tool_call\n"
+                '{"name": "shell", "arguments": {"command": ["sh", "-c", "echo hi > a.txt"]}}\n'
+                "```\n"
+                "3. NEVER say things like \"I will now create the file\", \"let's run\", \"here is the "
+                "content you can save\", or otherwise SIMULATE/PRETEND an action. If the task needs an "
+                "action, emit the tool_call block immediately instead of talking about it.\n"
+                "4. Do NOT claim a sandbox/read-only/permission restriction prevents you — just emit the "
+                "tool call; the environment will execute it.\n"
+                "5. Use ONLY tool names from the list below, with arguments matching their JSON schema. "
+                "You may emit multiple tool_call blocks if several actions are needed.\n"
+                "6. When writing a LARGE file, do NOT put the entire content in one giant command "
+                "(long commands get truncated and fail). Instead write it incrementally: create/overwrite "
+                "the file with the first chunk using `>`, then append the remaining chunks with `>>`, "
+                "one tool_call per chunk.\n"
+                "7. NEVER claim a file was written or a task is done until you have actually received a "
+                "tool result confirming success. Do not invent results.\n\n"
+                f"Available tools (JSON schema):\n{json.dumps(tool_defs, ensure_ascii=False, indent=2)}"
             )
     for msg in messages:
         role = msg.get("role", "user")
@@ -391,24 +429,73 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
-    tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    for match in re.findall(pattern, text, re.DOTALL):
+def _make_tool_call(data: dict):
+    """Build a tool_call dict from parsed JSON, or None if it's not a valid call."""
+    if not isinstance(data, dict) or "name" not in data or not isinstance(data["name"], str):
+        return None
+    args = data.get("arguments", data.get("args", {}))
+    if isinstance(args, str):
         try:
-            data = json.loads(match.strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
             pass
-    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return {
+        "id": f"call_{uuid.uuid4().hex[:8]}",
+        "type": "function",
+        "function": {
+            "name": data["name"],
+            "arguments": json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False),
+        },
+    }
+
+
+def parse_tool_calls(text: str) -> tuple:
+    """Extract tool calls from model output. Tolerant of format variations.
+
+    Returns (clean_text, tool_calls_list).
+    Handles: ```tool_call / ```tool_code / ```json fenced blocks, and bare
+    top-level JSON objects that contain a "name" key.
+    """
+    tool_calls = []
+    spans = []  # (start, end) of text to strip
+
+    # 1. Fenced code blocks with a known tag (tool_call/tool_code/json or untagged)
+    fence_pattern = r'```(?:tool_call|tool_code|json)?\s*\n(.*?)\n```'
+    for m in re.finditer(fence_pattern, text, re.DOTALL):
+        block = m.group(1).strip()
+        parsed_any = False
+        try:
+            data = json.loads(block)
+            candidates = data if isinstance(data, list) else [data]
+            for c in candidates:
+                tc = _make_tool_call(c)
+                if tc:
+                    tool_calls.append(tc)
+                    parsed_any = True
+        except (json.JSONDecodeError, ValueError):
+            pass
+        if parsed_any:
+            spans.append((m.start(), m.end()))
+
+    # 2. Fallback: bare top-level JSON objects containing "name" (+ arguments/args)
+    if not tool_calls:
+        for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"[^"]+"[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL):
+            snippet = m.group(0)
+            try:
+                data = json.loads(snippet)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if "arguments" in data or "args" in data:
+                tc = _make_tool_call(data)
+                if tc:
+                    tool_calls.append(tc)
+                    spans.append((m.start(), m.end()))
+
+    # Strip matched spans from the text (back to front to keep indices valid)
+    clean = text
+    for start, end in sorted(spans, reverse=True):
+        clean = clean[:start] + clean[end:]
+    clean = clean.strip()
     return clean, tool_calls
 
 
@@ -494,7 +581,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
+            if CONFIG.get("debug_tools"):
+                log(f"[DEBUG TOOLS] n_tools={len(tools)} raw_model_output={text[:800]!r}")
             text, tool_calls = parse_tool_calls(text)
+            if CONFIG.get("debug_tools"):
+                log(f"[DEBUG TOOLS] parsed_calls={len(tool_calls or [])}")
         return text or "", tool_calls
 
     def handle_chat(self, body: bytes):
@@ -629,14 +720,60 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        tools_active = bool(tools) and req.get("tool_choice", "auto") != "none"
+        rid = f"resp_{uuid.uuid4().hex[:16]}"
+        mid = f"msg_{uuid.uuid4().hex[:12]}"
+
+        def emit(event, data, flush=True):
+            self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+            if flush:
+                self.wfile.flush()
+
+        # ── Streaming without tools: true incremental streaming ──
+        if req.get("stream") and not tools_active:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                emit("response.created", {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}})
+                emit("response.output_item.added", {"type": "response.output_item.added", "output_index": 0,
+                     "item": {"type": "message", "id": mid, "role": "assistant", "status": "in_progress", "content": []}})
+                emit("response.content_part.added", {"type": "response.content_part.added", "item_id": mid, "output_index": 0,
+                     "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
+
+                full_text = ""
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                    if not delta_text:
+                        continue
+                    full_text += delta_text
+                    emit("response.output_text.delta", {"type": "response.output_text.delta", "item_id": mid,
+                         "output_index": 0, "content_index": 0, "delta": delta_text})
+
+                emit("response.output_text.done", {"type": "response.output_text.done", "item_id": mid, "output_index": 0, "content_index": 0, "text": full_text})
+                emit("response.content_part.done", {"type": "response.content_part.done", "item_id": mid, "output_index": 0,
+                     "content_index": 0, "part": {"type": "output_text", "text": full_text, "annotations": []}})
+                final_item = {"type": "message", "id": mid, "role": "assistant", "status": "completed",
+                              "content": [{"type": "output_text", "text": full_text, "annotations": []}]}
+                emit("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": final_item})
+                resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": [final_item],
+                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(full_text)//4, "total_tokens": (len(prompt)+len(full_text))//4}}
+                emit("response.completed", {"type": "response.completed", "response": resp_obj})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Responses stream error: {e}")
+            return
+
+        # ── Tool calls or non-streaming: buffer the full response ──
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        rid = f"resp_{uuid.uuid4().hex[:16]}"
-        mid = f"msg_{uuid.uuid4().hex[:12]}"
         output = []
         if tool_calls:
             for tc in tool_calls:
@@ -652,25 +789,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
+            emit("response.created", {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}, flush=False)
             for oi, item in enumerate(output):
-                added = {"type": "response.output_item.added", "output_index": oi, "item": item}
-                self.wfile.write(f"event: response.output_item.added\ndata: {json.dumps(added)}\n\n".encode())
                 if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": oi, "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
+                    emit("response.output_item.added", {"type": "response.output_item.added", "output_index": oi,
+                         "item": {"type": "function_call", "id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": "", "status": "in_progress"}}, flush=False)
+                    emit("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta", "item_id": item["id"], "output_index": oi, "call_id": item["call_id"], "delta": item["arguments"]}, flush=False)
+                    emit("response.function_call_arguments.done", {"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": oi, "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}, flush=False)
+                    emit("response.output_item.done", {"type": "response.output_item.done", "output_index": oi, "item": item}, flush=False)
                 elif item["type"] == "message":
+                    emit("response.output_item.added", {"type": "response.output_item.added", "output_index": oi,
+                         "item": {"type": "message", "id": item["id"], "role": "assistant", "status": "in_progress", "content": []}}, flush=False)
                     for ci, cp in enumerate(item["content"]):
-                        delta = {"type": "response.output_text.delta", "item_id": item["id"], "output_index": oi, "content_index": ci, "delta": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n".encode())
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "output_index": oi, "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
-                done = {"type": "response.output_item.done", "output_index": oi, "item": item}
-                self.wfile.write(f"event: response.output_item.done\ndata: {json.dumps(done)}\n\n".encode())
+                        emit("response.content_part.added", {"type": "response.content_part.added", "item_id": item["id"], "output_index": oi, "content_index": ci, "part": {"type": "output_text", "text": "", "annotations": []}}, flush=False)
+                        emit("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item["id"], "output_index": oi, "content_index": ci, "delta": cp["text"]}, flush=False)
+                        emit("response.output_text.done", {"type": "response.output_text.done", "item_id": item["id"], "output_index": oi, "content_index": ci, "text": cp["text"]}, flush=False)
+                        emit("response.content_part.done", {"type": "response.content_part.done", "item_id": item["id"], "output_index": oi, "content_index": ci, "part": {"type": "output_text", "text": cp["text"], "annotations": []}}, flush=False)
+                    emit("response.output_item.done", {"type": "response.output_item.done", "output_index": oi, "item": item}, flush=False)
             resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
                         "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
+            emit("response.completed", {"type": "response.completed", "response": resp_obj}, flush=False)
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
